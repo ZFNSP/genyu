@@ -1,109 +1,126 @@
-import streamlit as st
-import numpy as np
+import requests
 import pandas as pd
-import yfinance as yf
+import zipfile
+import io
+from bs4 import BeautifulSoup
+import datetime
 
-# ページ設定
-st.set_page_config(page_title="原油価格分析 (Schwartz Model)", layout="centered")
+# ==========================================
+# 設定エリア
+# ==========================================
+# 検索したい銘柄コード（証券コード）のリスト
+TARGET_TICKERS = ['6368', '6920', '8035', '1969']  # 例: オルガノ, レーザーテック, TEL, 高砂熱学
+# 検索する日付（直近の平日を指定してください）
+TARGET_DATE = '2025-11-14' # ※ここを適宜変更してください（決算発表が多い日推奨）
+# ==========================================
 
-class SchwartzOneFactor:
-    def __init__(self, dt=1/252):
-        self.dt = dt
-        self.kappa = None
-        self.alpha = None
-        self.sigma = None
-        self.stationary_std = None
+EDINET_API_URL = "https://disclosure.edinet-fsa.go.jp/api/v2"
 
-    def fit(self, prices):
-        log_prices = np.log(prices)
-        x_t = log_prices[1:]
-        x_t_minus_1 = log_prices[:-1]
-        
-        slope, intercept = np.polyfit(x_t_minus_1, x_t, 1)
-        
-        self.kappa = -np.log(slope) / self.dt
-        self.alpha = intercept / (1 - slope)
-        
-        residuals = x_t - (slope * x_t_minus_1 + intercept)
-        resid_std = np.std(residuals)
-        
-        self.sigma = resid_std * np.sqrt((2 * self.kappa) / (1 - slope**2))
-        self.stationary_std = self.sigma / np.sqrt(2 * self.kappa)
-        
-        return {
-            "Kappa (Speed)": self.kappa,
-            "Alpha (Log Mean)": self.alpha,
-            "Sigma (Vol)": self.sigma,
-            "Half-Life (Days)": (np.log(2) / self.kappa) * 252
-        }
+def get_document_list(date):
+    """指定日の提出書類一覧を取得"""
+    params = {'date': date, 'type': 2}
+    # ※APIキー（Subscription-Key）がある場合はheaderに追加推奨
+    res = requests.get(f"{EDINET_API_URL}/documents.json", params=params)
+    if res.status_code != 200:
+        print(f"Error: {res.status_code}")
+        return []
+    return res.json().get('results', [])
 
-    def calculate_z_score(self, current_price):
-        if self.alpha is None: return 0.0
-        log_price = np.log(current_price)
-        return (log_price - self.alpha) / self.stationary_std
+def get_xbrl_data(doc_id):
+    """XBRLファイルをダウンロードして解析"""
+    url = f"{EDINET_API_URL}/documents/{doc_id}"
+    params = {'type': 1} # 1: XBRL
+    res = requests.get(url, params=params)
+    
+    if res.status_code != 200:
+        return None
+
+    # Zipを展開してXBRLファイルを探す
+    with zipfile.ZipFile(io.BytesIO(res.content)) as z:
+        for filename in z.namelist():
+            # "PublicDoc" フォルダ内の .xbrl ファイルが財務諸表本体
+            if 'PublicDoc' in filename and filename.endswith('.xbrl'):
+                with z.open(filename) as f:
+                    return BeautifulSoup(f, 'lxml-xml')
+    return None
+
+def find_order_backlog(soup):
+    """受注残高に関連しそうなタグを探して値を返す"""
+    # 企業によってタグ名が微妙に異なるため、部分一致で探索
+    # 標準的なタグ: jpcrp_cor:OrderBacklog...
+    
+    candidates = []
+    
+    # 全タグから 'OrderBacklog' (受注残高) を含むものを検索
+    tags = soup.find_all(lambda tag: tag.name and 'OrderBacklog' in tag.name)
+    
+    for tag in tags:
+        # コンテキスト（CurrentYear/Instantなど）を確認
+        context_id = tag.get('contextRef')
+        value = tag.text.strip()
+        
+        # 数値が入っているものだけ抽出（空文字やテキストブロックを除く）
+        if value and value.replace(',', '').replace('-', '').isdigit():
+            # contextRefに 'Current' や 'Instant' が含まれるものを優先（今年度期末）
+            if 'Current' in context_id or 'Instant' in context_id:
+                candidates.append({
+                    'tag_name': tag.name,
+                    'value': float(value),
+                    'context': context_id
+                })
+    
+    return candidates
 
 def main():
-    st.title("🛢️ 原油先物 (CL=F) ミスプライス分析")
-    st.markdown("Schwartzの1ファクターモデル（平均回帰）を用いた適正価格の推定")
+    print(f"Searching documents for {TARGET_DATE}...")
+    docs = get_document_list(TARGET_DATE)
+    
+    # ターゲット銘柄の書類だけフィルタリング（四半期報告書 or 有価証券報告書）
+    target_docs = [
+        d for d in docs 
+        if d['secCode'] in [t + '0' for t in TARGET_TICKERS] # APIは5桁(末尾0)で返ってくることが多い
+        and d['docDescription'] is not None
+        and ('四半期' in d['docDescription'] or '有価証券' in d['docDescription'])
+    ]
+    
+    print(f"Found {len(target_docs)} relevant documents.")
+    
+    results = []
+    
+    for doc in target_docs:
+        ticker = doc['secCode'][:-1]
+        name = doc['filerName']
+        print(f"Processing: {name} ({ticker})...")
+        
+        soup = get_xbrl_data(doc['docID'])
+        if not soup:
+            print(" -> Failed to download XBRL.")
+            continue
+            
+        backlogs = find_order_backlog(soup)
+        
+        if backlogs:
+            # 複数のタグが見つかった場合、最も数値が大きいもの（連結合計の可能性が高い）を採用する簡易ロジック
+            # 厳密にはContextRef解析が必要だが、スクリーニング用途ならこれで十分機能する
+            best_match = max(backlogs, key=lambda x: x['value'])
+            results.append({
+                'Ticker': ticker,
+                'Name': name,
+                'OrderBacklog (Million Yen?)': best_match['value'] / 1000000, # 単位調整（仮）
+                'Raw Value': best_match['value'],
+                'Tag Found': best_match['tag_name']
+            })
+            print(f" -> Found Backlog: {best_match['value']}")
+        else:
+            print(" -> Order Backlog tag NOT found (Look for 'Inventories' instead?).")
 
-    # サイドバー設定
-    with st.sidebar:
-        ticker = st.text_input("ティッカーシンボル", value="CL=F")
-        lookback = st.slider("過去データ期間 (年)", 1, 5, 2)
-        run_btn = st.button("分析実行")
-
-    if run_btn:
-        with st.spinner(f'{ticker} のデータを取得・計算中...'):
-            try:
-                # データ取得
-                data = yf.download(ticker, period=f"{lookback}y", interval="1d", progress=False)
-                
-                if len(data) < 100:
-                    st.error("エラー: データが不足しています。ティッカーを確認してください。")
-                    return
-                
-                prices = data['Close'].values.flatten()
-                last_date = data.index[-1].date()
-                current_price = prices[-1]
-
-                # モデル適用
-                model = SchwartzOneFactor()
-                params = model.fit(prices)
-                z_score = model.calculate_z_score(current_price)
-                mean_price = np.exp(params['Alpha (Log Mean)'])
-
-                # --- 結果表示セクション ---
-                
-                # メイン指標の表示 (Metrics)
-                col1, col2, col3 = st.columns(3)
-                col1.metric("現在価格", f"${current_price:.2f}")
-                col2.metric("理論適正価格 (長期)", f"${mean_price:.2f}", delta=f"{current_price - mean_price:.2f}")
-                col3.metric("Zスコア (乖離度)", f"{z_score:.2f} σ")
-
-                st.divider()
-
-                # シグナル判定
-                if z_score > 2.0:
-                    st.error(f"### 📉 SELL SIGNAL (Overbought)\n現在価格は長期平均から +{z_score:.2f}σ 乖離しており、統計的に割高です。")
-                elif z_score < -2.0:
-                    st.success(f"### 📈 BUY SIGNAL (Oversold)\n現在価格は長期平均から {z_score:.2f}σ 乖離しており、統計的に割安です。")
-                else:
-                    st.info(f"### ⚖️ NEUTRAL\n現在価格は通常の変動範囲内（±2σ以内）です。")
-
-                st.divider()
-
-                # パラメータ詳細
-                with st.expander("詳細なモデルパラメータを見る"):
-                    st.write(f"**平均回帰速度 (Kappa):** {params['Kappa (Speed)']:.4f}")
-                    st.write(f"**半減期 (Half-Life):** {params['Half-Life (Days)']:.1f} 日")
-                    st.write(f"**ボラティリティ (Sigma):** {params['Sigma (Vol)']:.4f}")
-                    st.caption("半減期が短いほど、価格が平均に戻る力が強いことを示します。")
-
-            except Exception as e:
-                st.error(f"エラーが発生しました: {e}")
-
+    # 結果表示
+    if results:
+        df = pd.DataFrame(results)
+        print("\n=== Screening Results ===")
+        print(df)
     else:
-        st.info("サイドバーの「分析実行」ボタンを押してください。")
+        print("\nNo backlog data found.")
 
 if __name__ == "__main__":
     main()
