@@ -11,6 +11,53 @@ from datetime import datetime, timedelta
 # ==========================================
 st.set_page_config(page_title="LPPL Global Monitor", layout="wide")
 
+# ==========================================
+# 0. ページ設定 & 関数定義 (既存の場所に追加)
+# ==========================================
+
+# ▼▼▼▼▼ ハースト指数計算関数 (追加) ▼▼▼▼▼
+def calculate_hurst(ts, max_lag=20):
+    """
+    R/S分析によるハースト指数の簡易計算
+    ts: 価格データ (1次元配列)
+    """
+    try:
+        lags = range(2, max_lag)
+        tau = [np.sqrt(np.std(np.subtract(ts[lag:], ts[:-lag]))) for lag in lags]
+        poly = np.polyfit(np.log(lags), np.log(tau), 1)
+        return poly[0] * 2.0 # 簡易的なHurst推定
+    except:
+        return 0.5 # エラー時はランダム(0.5)を返す
+# ▲▲▲▲▲ ここまで ▲▲▲▲▲
+
+# ... (中略: メイン処理の中) ...
+
+        # ==========================================
+        # データ取得後の処理エリア
+        # ==========================================
+        
+        # ▼▼▼▼▼ 計算と表示 (メイン処理内に追加) ▼▼▼▼▼
+        # 価格データのログをとって計算
+        h_val = calculate_hurst(np.log(full_data.values), max_lag=min(100, len(full_data)//2))
+        
+        # 表示用カラムを作成（既存のmetricエリアに追加推奨）
+        st.markdown("### 🌊 モメンタム持続性診断 (Hurst Exponent)")
+        c_h1, c_h2 = st.columns([1, 3])
+        
+        with c_h1:
+            st.metric("ハースト指数 (H)", f"{h_val:.4f}")
+        
+        with c_h2:
+            if h_val > 0.65:
+                st.success(f"🚀 **強烈なトレンド持続中 (H > 0.65)**\n\n慣性の法則が強く働いています。「下がるまで持ち続ける」が正解です。")
+            elif h_val > 0.5:
+                st.info(f"📈 **緩やかなトレンド (0.5 < H < 0.65)**\n\n上昇傾向ですが、ノイズも混じっています。")
+            elif h_val < 0.4:
+                st.warning(f"📉 **平均回帰性が強い (H < 0.4)**\n\n上がれば叩かれる「ジグザグ相場」です。深追いは禁物。")
+            else:
+                st.warning(f"🎲 **ランダムウォーク (H ≈ 0.5)**\n\n方向感がありません。")
+        # ▲▲▲▲▲ ここまで ▲▲▲▲▲
+
 def lppl_func(t, tc, m, omega, A, B, C, phi):
     """ Johansen-Ledoit-Sornette (JLS) Model """
     dt = tc - t
