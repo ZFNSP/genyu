@@ -1,0 +1,23 @@
+from statsmodels.tsa.stattools import grangercausalitytests
+
+def analyze_time_lag(leader_data, laggard_data, max_lag=30):
+    # データを結合（LeaderとLaggardの日次リターン）
+    df = pd.concat([laggard_data, leader_data], axis=1)
+    
+    # グレンジャー因果性検定
+    # "Leaderの動きが Laggardの原因になっているか" をラグを変えながら検証
+    results = grangercausalitytests(df, maxlag=max_lag, verbose=False)
+    
+    # 最もp値が低い（＝因果関係が強い）ラグ日数を探す
+    best_lag = -1
+    min_p_value = 1.0
+    
+    for lag, result in results.items():
+        # F検定のp値を取得
+        p_value = result[0]['ssr_ftest'][1]
+        if p_value < min_p_value:
+            min_p_value = p_value
+            best_lag = lag
+            
+    print(f"最適なタイムラグ: {best_lag} 日 (p-value: {min_p_value:.4f})")
+    return best_lag
