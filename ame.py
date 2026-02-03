@@ -4,7 +4,8 @@ import pandas as pd
 
 # 1. データの取得 (期間: 直近6ヶ月)
 tickers = ["QQQ", "IWM", "VUG", "VTV", "RSP", "SPY"]
-data = yf.download(tickers, period="6mo")['Adj Close']
+# auto_adjust=False を追加して、'Adj Close' 列を確実に取得する
+data = yf.download(tickers, period="6mo", auto_adjust=False)['Adj Close']
 
 # 2. レシオの計算
 # 開始日を「1.0」として正規化（リベース）することで、変化率を比較しやすくします
